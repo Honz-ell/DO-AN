@@ -7,7 +7,7 @@ echo.
 set /a count=1
 :loop
 echo.
-echo ===== Lan chay thu%count% =====
+echo ===== Lan chay %count% =====
 echo Thời gian: %time%
 echo.
 
