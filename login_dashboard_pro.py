@@ -1,5 +1,5 @@
 """
-login_dashboard_pro.py - Dashboard có đăng nhập, dark theme, bản đồ, dự báo, lịch sử cảnh báo
+login_dashboard_pro.py - Dashboard có đăng nhập, dark theme, bản đồ, dự báo AQI 24h, lịch sử cảnh báo
 """
 
 import streamlit as st
@@ -16,7 +16,9 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import time
 import numpy as np
-import hashlib
+from statsmodels.tsa.arima.model import ARIMA
+import warnings
+warnings.filterwarnings('ignore')
 
 # =============================================
 # PAGE CONFIG
@@ -29,7 +31,7 @@ st.set_page_config(
 )
 
 # =============================================
-# CUSTOM CSS - DARK THEME (giữ nguyên như cũ)
+# CUSTOM CSS - DARK THEME
 # =============================================
 st.markdown("""
 <style>
@@ -155,7 +157,6 @@ def get_aqi_class(aqi):
     else: return "aqi-hazardous"
 
 def send_alert_email(to_email, city, aqi, level):
-    """Send alert email with clean HTML"""
     try:
         color = get_aqi_color(aqi)
         html = f"""
@@ -208,7 +209,6 @@ def send_alert_email(to_email, city, aqi, level):
         return False
 
 def log_alert_to_db(user_id, city, aqi):
-    """Ghi cảnh báo vào bảng alert_history"""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
@@ -219,7 +219,6 @@ def log_alert_to_db(user_id, city, aqi):
     conn.close()
 
 def get_alert_history(user_id):
-    """Lấy lịch sử cảnh báo của user"""
     conn = get_connection()
     df = pd.read_sql("""
         SELECT city, aqi, sent_at FROM alert_history
@@ -230,29 +229,47 @@ def get_alert_history(user_id):
     conn.close()
     return df
 
-def load_forecast_results():
-    """Đọc kết quả so sánh mô hình từ file CSV"""
+def generate_forecast(city, hours=24):
+    """Tạo dự báo AQI cho thành phố trong `hours` giờ tới sử dụng ARIMA"""
+    conn = get_connection()
+    query = """
+        SELECT timestamp, aqi FROM aqi_readings
+        WHERE city = ?
+        ORDER BY timestamp
+    """
+    df = pd.read_sql(query, conn, params=(city,))
+    conn.close()
+    if len(df) < 10:
+        return None
+    # Lấy chuỗi AQI
+    ts = df['aqi'].values
     try:
-        df = pd.read_csv('model_comparison_results.csv')
-        return df
-    except:
+        # Fit ARIMA(1,0,1) đơn giản
+        model = ARIMA(ts, order=(1,0,1))
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=hours)
+        # Tạo timestamp cho các giờ tới (giờ hiện tại + 1,2,...)
+        last_time = pd.to_datetime(df['timestamp'].iloc[-1])
+        # Làm tròn lên giờ tiếp theo
+        next_hour = last_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        future_times = [next_hour + timedelta(hours=i) for i in range(hours)]
+        return pd.DataFrame({'timestamp': future_times, 'aqi': forecast})
+    except Exception as e:
+        print(f"Forecast error for {city}: {e}")
         return None
 
 # =============================================
 # MAP GENERATION
 # =============================================
 def generate_vietnam_map(cities_data):
-    """Tạo bản đồ Việt Nam với màu sắc theo AQI"""
-    # Tọa độ trung tâm Việt Nam
     map_center = [16.0, 108.0]
     m = folium.Map(location=map_center, zoom_start=5.5, tiles='CartoDB dark_matter')
-    
     for city, aqi, lat, lon in cities_data:
         color = get_aqi_color(aqi)
         popup_text = f"<b>{city}</b><br>AQI: {aqi}<br>Mức: {get_aqi_level(aqi)}"
         folium.CircleMarker(
             location=[lat, lon],
-            radius=10,
+            radius=12,
             color=color,
             fill=True,
             fill_color=color,
@@ -260,7 +277,6 @@ def generate_vietnam_map(cities_data):
             popup=popup_text,
             tooltip=city
         ).add_to(m)
-    
     return m
 
 # =============================================
@@ -356,63 +372,76 @@ else:
     """, unsafe_allow_html=True)
     
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 OVERVIEW", "🗺️ MAP", "📊 FORECAST", "📜 HISTORY"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 OVERVIEW", "🗺️ MAP", "📊 COMPARE", "📜 HISTORY"])
     
     with tab1:
-        # Fetch latest AQI for user's cities
+        st.markdown("### 📊 Chất lượng không khí hiện tại")
         conn = get_connection()
         cursor = conn.cursor()
         alerts_to_send = []
-        
+
+        # Chia cột theo số lượng thành phố
         cols = st.columns(len(cities))
         for idx, (city, threshold) in enumerate(cities):
             cursor.execute("""
-                SELECT aqi, temperature, timestamp FROM aqi_readings
-                WHERE city = ? ORDER BY timestamp DESC LIMIT 1
+                SELECT aqi, temperature, humidity, timestamp 
+                FROM aqi_readings 
+                WHERE city = ? 
+                ORDER BY timestamp DESC 
+                LIMIT 1
             """, (city,))
             result = cursor.fetchone()
             if result:
-                aqi, temp, ts = result
+                aqi, temp, humidity, ts = result
                 level = get_aqi_level(aqi)
                 aqi_class = get_aqi_class(aqi)
                 if aqi > threshold and not st.session_state.alert_sent:
                     alerts_to_send.append((city, aqi, level))
+                
+                with cols[idx]:
+                    # Card dọc
+                    st.markdown(f"""
+                    <div class="card" style="text-align: center; padding: 1rem;">
+                        <h3 style="margin-bottom: 0.5rem;">{city}</h3>
+                        <div class="aqi-value {aqi_class}" style="font-size: 2.5rem;">{aqi}</div>
+                        <div style="color: #aaa; margin-bottom: 0.5rem;">{level}</div>
+                        <div style="display: flex; flex-direction: column; gap: 0.3rem; margin: 0.5rem 0;">
+                            <span class="stat-box">🌡️ Nhiệt độ: {temp}°C</span>
+                            <span class="stat-box">💧 Độ ẩm: {humidity}%</span>
+                            <span class="stat-box">⚠️ Ngưỡng: >{threshold}</span>
+                        </div>
+                        <div style="color: #666; font-size: 0.7rem;">Cập nhật: {convert_to_vn_time(ts)}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
                 with cols[idx]:
                     st.markdown(f"""
                     <div class="card" style="text-align: center;">
                         <h3>{city}</h3>
-                        <div class="aqi-value {aqi_class}">{aqi}</div>
-                        <div style="color: #666;">{level}</div>
-                        <div style="display: flex; justify-content: center; gap: 1rem; margin: 1rem 0;">
-                            <span class="stat-box">🌡️ {temp}°C</span>
-                            <span class="stat-box">⚠️ >{threshold}</span>
-                        </div>
-                        <div style="color: #666; font-size: 0.8rem;">{convert_to_vn_time(ts)}</div>
+                        <p>Chưa có dữ liệu</p>
                     </div>
                     """, unsafe_allow_html=True)
         conn.close()
-        
+
         if alerts_to_send and not st.session_state.alert_sent:
-            with st.spinner("Sending alerts..."):
+            with st.spinner("Đang gửi cảnh báo..."):
                 for city, aqi, level in alerts_to_send:
                     if send_alert_email(st.session_state.email, city, aqi, level):
                         log_alert_to_db(st.session_state.user_id, city, aqi)
                         time.sleep(1)
                 st.session_state.alert_sent = True
-                st.success(f"✅ {len(alerts_to_send)} alert(s) sent")
+                st.success(f"✅ Đã gửi {len(alerts_to_send)} cảnh báo")
     
     with tab2:
         st.markdown("### 🗺️ Air Quality Map")
-        # Lấy dữ liệu mới nhất cho tất cả thành phố (có tọa độ)
         conn = get_connection()
         all_cities_df = pd.read_sql("""
-            SELECT aqi, city, temperature FROM aqi_readings
+            SELECT aqi, city FROM aqi_readings
             WHERE (city, timestamp) IN (
                 SELECT city, MAX(timestamp) FROM aqi_readings GROUP BY city
             )
         """, conn)
         conn.close()
-        # Gắn tọa độ (từ danh sách mặc định)
         coords = {
             'Hanoi': (21.0285, 105.8542), 'Haiphong': (20.8449, 106.6881),
             'Danang': (16.0544, 108.2022), 'HCMC': (10.8231, 106.6297),
@@ -430,25 +459,89 @@ else:
             st.info("No data available for map")
     
     with tab3:
-        st.markdown("### 📊 Model Comparison (ARIMA vs XGBoost)")
-        forecast_df = load_forecast_results()
-        if forecast_df is not None and not forecast_df.empty:
-            # Hiển thị bảng
-            st.dataframe(forecast_df, use_container_width=True)
-            # Biểu đồ so sánh RMSE
-            fig = go.Figure()
-            fig.add_trace(go.Bar(name='ARIMA', x=forecast_df['city'], y=forecast_df['ARIMA_RMSE'], marker_color='blue'))
-            fig.add_trace(go.Bar(name='XGBoost', x=forecast_df['city'], y=forecast_df['XGB_RMSE'], marker_color='red'))
-            fig.update_layout(title='RMSE Comparison', xaxis_title='City', yaxis_title='RMSE', barmode='group', template='plotly_dark')
-            st.plotly_chart(fig, use_container_width=True)
-            # Thống kê
-            avg_arima = forecast_df['ARIMA_RMSE'].mean()
-            avg_xgb = forecast_df['XGB_RMSE'].mean()
-            st.metric("Average RMSE - ARIMA", f"{avg_arima:.2f}")
-            st.metric("Average RMSE - XGBoost", f"{avg_xgb:.2f}")
-        else:
-            st.info("Forecast results not available. Please run compare_models.py first.")
+        st.markdown("### 📈 Xu hướng AQI 7 ngày qua & Xếp hạng thành phố")
     
+        # Lấy dữ liệu 7 ngày gần nhất cho tất cả các thành phố của user
+        conn = get_connection()
+        # Lấy danh sách thành phố của user
+        user_cities = [c[0] for c in cities]
+        if not user_cities:
+            st.info("Không có thành phố nào được theo dõi.")
+            st.stop()
+        else:
+            placeholders = ','.join(['?']*len(user_cities))
+            query = f"""
+                SELECT city, aqi, timestamp 
+                FROM aqi_readings 
+                WHERE city IN ({placeholders})
+                AND timestamp >= datetime('now', '-7 days')
+                ORDER BY timestamp ASC
+            """
+            df = pd.read_sql(query, conn, params=user_cities)
+            conn.close()
+            
+            if df.empty:
+                st.warning("Không có dữ liệu trong 7 ngày qua.")
+            else:
+                # Chuyển timestamp sang datetime
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                # Thêm cột giờ VN (chỉ để hiển thị nếu cần)
+                df['time_vn'] = df['timestamp'].apply(lambda x: x + timedelta(hours=7))
+                
+                # 1. Biểu đồ xu hướng AQI
+                fig = px.line(df, x='time_vn', y='aqi', color='city',
+                            title='Diễn biến AQI 7 ngày qua',
+                            labels={'time_vn': 'Thời gian (VN)', 'aqi': 'AQI', 'city': 'Thành phố'})
+                fig.update_layout(
+                    template='plotly_dark',
+                    height=500,
+                    paper_bgcolor="#0f1117",
+                    plot_bgcolor="#0f1117"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # 2. Xếp hạng các thành phố theo AQI mới nhất
+                # Lấy bản ghi mới nhất của mỗi thành phố
+                latest = df.sort_values('timestamp').groupby('city').last().reset_index()
+                latest = latest.sort_values('aqi', ascending=False)  # xếp hạng từ cao xuống thấp
+                
+                # Thêm cột màu sắc và mức độ
+                def get_level(aqi):
+                    if aqi <= 50: return "Tốt"
+                    elif aqi <= 100: return "Trung bình"
+                    elif aqi <= 150: return "Kém"
+                    elif aqi <= 200: return "Xấu"
+                    else: return "Rất xấu"
+                
+                latest['level'] = latest['aqi'].apply(get_level)
+                
+                # Hiển thị bảng xếp hạng
+                st.subheader("🏆 Xếp hạng chất lượng không khí hiện tại")
+                display_df = latest[['city', 'aqi', 'level']].rename(columns={'city': 'Thành phố', 'aqi': 'AQI', 'level': 'Mức độ'})
+                # Thêm thanh tiến trình màu
+                st.dataframe(display_df, use_container_width=True)
+                
+                # Tùy chọn: bar chart cho xếp hạng
+                fig2 = px.bar(latest, x='city', y='aqi', color='aqi',
+                            color_continuous_scale='RdYlGn_r',
+                            title='So sánh AQI hiện tại giữa các thành phố',
+                            labels={'city': 'Thành phố', 'aqi': 'AQI'})
+                fig2.update_layout(
+                    template='plotly_dark',
+                    height=400,
+                    paper_bgcolor="#0f1117",
+                    plot_bgcolor="#0f1117"
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+                
+                # Giải thích
+                with st.expander("ℹ️ Ghi chú"):
+                    st.markdown("""
+                    - **Xu hướng 7 ngày**: Đường biểu diễn AQI theo thời gian.
+                    - **Xếp hạng**: Dựa trên giá trị AQI mới nhất của mỗi thành phố.
+                    - **Màu sắc**: Xanh (tốt) → Vàng → Cam → Đỏ (xấu).
+                    - Dữ liệu được cập nhật mỗi giờ từ IQAir API.
+                    """)
     with tab4:
         st.markdown("### 📜 Alert History")
         history_df = get_alert_history(st.session_state.user_id)
@@ -457,7 +550,6 @@ else:
             st.dataframe(history_df, use_container_width=True)
         else:
             st.info("No alerts have been sent yet.")
-
 # =============================================
 # FOOTER
 # =============================================

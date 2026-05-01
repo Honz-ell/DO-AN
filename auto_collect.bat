@@ -1,26 +1,26 @@
 @echo off
 cd /d D:\đồ án ngành
-echo ===== He Thong Giam Sat Tu Đong =====
-echo Bắt đầu: %date% %time%
+echo ===== He Thong Giam Sat Tu Dong =====
+echo  START: %date% %time%
 echo.
 
 set /a count=1
 :loop
 echo.
-echo ===== Lan chay %count% =====
-echo Thời gian: %time%
+echo ===== COUNT %count% =====
+echo TIME: %time%
 echo.
 
-echo 📥 Thu thập dữ liệu...
+echo  Thu thap du lieu...
 python producer.py
 
-echo 🔄 Xử lý dữ liệu...
+echo  Xu ly du lieu...
 python consumer.py
 
-echo 📧 Kiểm tra cảnh báo...
+echo  Kiem tra canh bao...
 python alert.py
 
-echo ⏰ Đợi 1 giờ (3600 giây)...
+echo  wait 1 hour (3600 giây)...
 timeout /t 3600
 
 set /a count+=1
